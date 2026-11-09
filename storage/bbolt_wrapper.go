@@ -18,8 +18,15 @@ type HistoricalSnapshot struct {
 }
 
 var bboltInstance *bbolt.DB
+
 const BucketName = "AtopHistoryBucket"
 const DbFileName = "atop_historical_data.db"
+
+// RetentionDays is how long samples are kept before PruneOldLogs removes them
+const RetentionDays = 7
+
+// TimestampLayout is the format of the Timestamp field and the suffix of every stored key
+const TimestampLayout = "2006-01-02 15:04:05"
 
 // InitializeStorage Engine mounts the single flat-file DB and establishes indices
 func InitializeStorage() error {
@@ -52,37 +59,62 @@ func SaveMetricSnapshot(snapshot HistoricalSnapshot) error {
 
 	return bboltInstance.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(BucketName))
-		
+
 		// Index structural keys by timestamp for fast sequential sorting
 		key := fmt.Sprintf("metric:%s", snapshot.Timestamp)
 		dataBytes, err := json.Marshal(snapshot)
 		if err != nil {
 			return err
 		}
-		
+
 		return bucket.Put([]byte(key), dataBytes)
 	})
 }
 
-// PruneOldLogs checks and wipes data older than 7 days from the archive
+// SaveMetricSnapshots stores many samples in a single transaction. One transaction per sample forces a disk
+// sync each time, which made importing a log file slow.
+func SaveMetricSnapshots(snapshots []HistoricalSnapshot) error {
+	if bboltInstance == nil {
+		return fmt.Errorf("database storage engine is offline")
+	}
+
+	return bboltInstance.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(BucketName))
+		for _, snapshot := range snapshots {
+			dataBytes, err := json.Marshal(snapshot)
+			if err != nil {
+				return err
+			}
+			if err := bucket.Put([]byte("metric:"+snapshot.Timestamp), dataBytes); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// PruneOldLogs checks and wipes data older than RetentionDays from the archive
 func PruneOldLogs() error {
 	if bboltInstance == nil {
 		return nil
 	}
 
-	// Calculate our strict 7-day retention threshold boundary
-	cutoffDate := time.Now().AddDate(0, 0, -7).Format("2006-01-02-15:04:05")
+	// Keys are "metric:" + UTC timestamp in TimestampLayout, so the cutoff must use the same layout and zone
+	cutoffKey := "metric:" + time.Now().UTC().AddDate(0, 0, -RetentionDays).Format(TimestampLayout)
 
 	return bboltInstance.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(BucketName))
-		cursor := bucket.Cursor()
 
-		// Loop through keys and drop old entries sequentially
-		for key, _ := cursor.First(); key != nil; key, _ = cursor.Next() {
-			if string(key) < "metric:"+cutoffDate {
-				_ = bucket.Delete(key)
-			} else {
-				break // Keys are sequential; stop early once we hit valid logs
+		// Collect expired keys first; deleting while the cursor is walking can skip entries
+		var expired [][]byte
+		cursor := bucket.Cursor()
+		for key, _ := cursor.First(); key != nil && string(key) < cutoffKey; key, _ = cursor.Next() {
+			expired = append(expired, append([]byte(nil), key...))
+		}
+
+		for _, key := range expired {
+			if err := bucket.Delete(key); err != nil {
+				return err
 			}
 		}
 		return nil

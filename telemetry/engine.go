@@ -4,127 +4,255 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"strings"
 	"time"
 )
 
-// RawRecordHeader defines the structural sequence preceding every timeline sample entry
-type RawRecordHeader struct {
-	CurTime  int64  // 8 bytes (Epoch tracking timestamp)
-	SstatLen uint16 // 2 bytes (Compressed system block footprint)
-	TstatLen uint16 // 2 bytes (Compressed process block footprint)
+// ErrNoMetricRecords is returned when a file has a valid header but no record could be decoded
+var ErrNoMetricRecords = errors.New("no metric records could be decoded (corrupt file or unexpected layout)")
+
+// maxSaneIntervalSeconds: a record covering more than a day is treated as since-boot totals, not a delta
+const maxSaneIntervalSeconds = 86400
+
+// sectorBytes is the size of one kernel disk sector, as used by the sector counters in atop's disk entries
+const sectorBytes = 512
+
+// virtualIfacePrefixes are interfaces left out of network totals: their traffic is already counted on the
+// physical interfaces underneath them (same list as reader.py)
+var virtualIfacePrefixes = []string{"lo", "bond", "docker", "veth", "br-", "virbr", "tun", "tap"}
+
+// FileData is everything decoded from one raw log
+type FileData struct {
+	Path    string
+	Header  *AtopRawHeader
+	Samples []Sample // chronological; the since-boot record is not included
+	Skipped int      // records that could not be decoded
 }
 
-// Adaptive Version Alignment Offsets Table
-type StructuralLayout struct {
-	CpuOffset int
-	MemOffset int
-	DskOffset int
-	MinSize   int
-}
-
-// GetLayoutForVersion returns byte positions optimized for different Linux atop profiles
-func GetLayoutForVersion(version uint16) StructuralLayout {
-	major := version >> 8
-	minor := version & 0xFF
-
-	// Handle Legacy Linux Deployments (e.g., RHEL / CentOS Old Distributions)
-	if major == 2 && minor <= 6 {
-		return StructuralLayout{CpuOffset: 0, MemOffset: 40, DskOffset: 72, MinSize: 104}
+// u64At reads a little-endian uint64 at the given offset, failing if it would run past the block
+func u64At(block []byte, offset int) (uint64, error) {
+	if offset < 0 || offset+8 > len(block) {
+		return 0, fmt.Errorf("field at offset %d is outside the %d-byte block", offset, len(block))
 	}
-	// Handle Intermediate Environments (e.g., Debian 10, Ubuntu 20.04)
-	if major == 2 && minor <= 9 {
-		return StructuralLayout{CpuOffset: 0, MemOffset: 48, DskOffset: 88, MinSize: 136}
-	}
-	// Default to Modern High-Performance Layouts (e.g., Ubuntu 24.04, RHEL 9, Arch Linux)
-	return StructuralLayout{CpuOffset: 0, MemOffset: 56, DskOffset: 104, MinSize: 168}
+	return binary.LittleEndian.Uint64(block[offset:]), nil
 }
 
-// UnpackSystemMetricsBlock targets a compressed data frame window and inflates it cleanly via zlib
-func UnpackSystemMetricsBlock(file *os.File, offset int64, compressedLen uint16) ([]byte, error) {
-	_, err := file.Seek(offset, io.SeekStart)
+// decodeSstat turns one decompressed system-statistics block into a Sample for an interval of `interval`
+// seconds ending at t. CPU, disk and network counters are per-interval deltas in atop raw logs.
+// It returns an error if the block does not look like the registered layout.
+func decodeSstat(block []byte, lay RawLayout, hdr *AtopRawHeader, t time.Time, interval int) (Sample, error) {
+	s := Sample{Time: t, Interval: interval}
+
+	// CPU
+	ncpu, err := u64At(block, lay.NrcpuOff)
+	if err != nil {
+		return s, err
+	}
+	if ncpu == 0 || ncpu > 4096 {
+		return s, fmt.Errorf("layout check failed: implausible CPU count %d", ncpu)
+	}
+	s.NCPU = int(ncpu)
+
+	var ticks [tickCount]uint64
+	for i := range ticks {
+		if ticks[i], err = u64At(block, lay.CPUOff+8*i); err != nil {
+			return s, err
+		}
+	}
+	// Guest time is already counted inside user time, so it is left out of the total (as in reader.py)
+	total := ticks[tickSystem] + ticks[tickUser] + ticks[tickNice] + ticks[tickIdle] +
+		ticks[tickWait] + ticks[tickIrq] + ticks[tickSoftirq] + ticks[tickSteal]
+
+	// A busy machine accumulates at most ncpu * interval * hertz ticks in one interval. Much more than that
+	// means the counters are totals since boot, which cannot give a percentage for this interval.
+	expected := float64(ncpu) * float64(interval) * float64(hdr.Hertz)
+	if total == 0 || float64(total) > 1.5*expected {
+		return s, fmt.Errorf("layout check failed: CPU ticks %d do not match the interval", total)
+	}
+	pct := func(v uint64) float64 { return 100.0 * float64(v) / float64(total) }
+	s.CPUBusy = pct(total - ticks[tickIdle] - ticks[tickWait])
+	s.CPUIOWait = pct(ticks[tickWait])
+	s.CPUSteal = pct(ticks[tickSteal])
+
+	// Load averages are stored as float32
+	for i, dst := range []*float64{&s.Load1, &s.Load5, &s.Load15} {
+		off := lay.LoadOff + 4*i
+		if off+4 > len(block) {
+			return s, fmt.Errorf("load average outside the block")
+		}
+		*dst = float64(math.Float32frombits(binary.LittleEndian.Uint32(block[off:])))
+	}
+
+	// Memory and swap are counted in pages
+	word := func(i int) (uint64, error) { return u64At(block, lay.MemOff+8*i) }
+	var mem [8]uint64
+	for i, idx := range []int{lay.MemPhys, lay.MemFree, lay.MemBuffer, lay.MemCache,
+		lay.MemSwapTotal, lay.MemSwapFree, lay.MemSlabReclaim} {
+		if mem[i], err = word(idx); err != nil {
+			return s, err
+		}
+	}
+	phys, free, buffers, cache := mem[0], mem[1], mem[2], mem[3]
+	swapTotal, swapFree, reclaim := mem[4], mem[5], mem[6]
+	if phys == 0 || free > phys {
+		return s, fmt.Errorf("layout check failed: implausible memory figures")
+	}
+	pageBytes := float64(hdr.PageSize)
+	reclaimable := free + cache + buffers + reclaim
+	var used uint64
+	if phys > reclaimable {
+		used = phys - reclaimable
+	}
+	s.MemPct = 100.0 * float64(used) / float64(phys)
+	s.MemUsedBytes = float64(used) * pageBytes
+	s.MemTotalBytes = float64(phys) * pageBytes
+	if swapTotal > 0 && swapFree <= swapTotal {
+		s.SwapUsedBytes = float64(swapTotal-swapFree) * pageBytes
+		s.SwapTotalBytes = float64(swapTotal) * pageBytes
+		s.SwapPct = 100.0 * float64(swapTotal-swapFree) / float64(swapTotal)
+	}
+
+	// Disks: read, write and busy time per device
+	for i := 0; i < lay.DskMax; i++ {
+		off := lay.DskOff + i*lay.DskStride
+		if off+lay.DskNameLen+40 > len(block) {
+			return s, fmt.Errorf("disk table runs past the end of the block")
+		}
+		name := block[off : off+lay.DskNameLen]
+		if !isPrintableName(name) {
+			break // the list ends at the first empty name
+		}
+		// Counters after the name: nread, nrsect, nwrite, nwsect, io_ms
+		c := off + lay.DskNameLen
+		nrsect, _ := u64At(block, c+8)
+		nwsect, _ := u64At(block, c+24)
+		ioMs, _ := u64At(block, c+32)
+		busy := 100.0 * float64(ioMs) / (float64(interval) * 1000.0)
+		s.Disks = append(s.Disks, DiskStat{
+			Name:      cString(name),
+			ReadMBps:  float64(nrsect) * sectorBytes / 1048576.0 / float64(interval),
+			WriteMBps: float64(nwsect) * sectorBytes / 1048576.0 / float64(interval),
+			BusyPct:   math.Min(busy, 100),
+		})
+	}
+
+	// Network: bytes per interface; virtual interfaces are skipped
+	nIfaces, _ := u64At(block, lay.NetCountOff)
+	if nIfaces > uint64(lay.NetMax) {
+		nIfaces = uint64(lay.NetMax)
+	}
+	for i := 0; i < int(nIfaces); i++ {
+		off := lay.NetOff + i*lay.NetStride
+		if off+lay.NetTxOff+8 > len(block) {
+			break
+		}
+		name := cString(block[off : off+lay.NetNameLen])
+		if name == "" || hasAnyPrefix(name, virtualIfacePrefixes) {
+			continue
+		}
+		rx, _ := u64At(block, off+lay.NetRxOff)
+		tx, _ := u64At(block, off+lay.NetTxOff)
+		s.Nets = append(s.Nets, NetStat{
+			Name:  name,
+			RxBps: float64(rx) / float64(interval),
+			TxBps: float64(tx) / float64(interval),
+		})
+	}
+
+	return s, nil
+}
+
+// hasAnyPrefix reports whether s starts with any of the prefixes
+func hasAnyPrefix(s string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPrintableName reports whether a NUL-padded name field starts with a printable character
+func isPrintableName(field []byte) bool {
+	if field[0] == 0 {
+		return false
+	}
+	for _, c := range field {
+		if c == 0 {
+			return true
+		}
+		if c < 0x20 || c > 0x7E {
+			return false
+		}
+	}
+	return true
+}
+
+// cString returns the NUL-terminated string held in a fixed-size field
+func cString(b []byte) string {
+	for i, c := range b {
+		if c == 0 {
+			return string(b[:i])
+		}
+	}
+	return string(b)
+}
+
+// inflateBlock reads a zlib-compressed block and returns exactly `size` decompressed bytes
+func inflateBlock(file *os.File, offset int64, compressedLen uint32, size uint32) ([]byte, error) {
+	compressed := make([]byte, compressedLen)
+	if _, err := io.ReadFull(io.NewSectionReader(file, offset, int64(compressedLen)), compressed); err != nil {
+		return nil, err
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+
+	out := make([]byte, size)
+	if _, err := io.ReadFull(zr, out); err != nil {
+		return nil, err
+	}
+	// The block must end exactly at the declared size
+	if n, _ := zr.Read(make([]byte, 1)); n != 0 {
+		return nil, fmt.Errorf("statistics block is longer than %d bytes", size)
+	}
+	return out, nil
+}
+
+// inflateAll reads a zlib-compressed block and returns all of its decompressed bytes
+func inflateAll(file *os.File, offset int64, compressedLen uint32) ([]byte, error) {
+	compressed := make([]byte, compressedLen)
+	if _, err := io.ReadFull(io.NewSectionReader(file, offset, int64(compressedLen)), compressed); err != nil {
+		return nil, err
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+	return io.ReadAll(zr)
+}
+
+// ReadFile decodes every usable record of one atop raw log. Records that cannot be decoded are counted in
+// Skipped. It returns ErrUnsupportedVersion for an unknown layout and ErrNoMetricRecords if nothing decodes.
+func ReadFile(path string) (*FileData, error) {
+	header, err := ReadAtopHeader(path)
+	if err != nil {
+		return nil, err
+	}
+	lay, err := findLayout(header)
 	if err != nil {
 		return nil, err
 	}
 
-	compressedBuffer := make([]byte, compressedLen)
-	_, err = io.ReadFull(file, compressedBuffer)
-	if err != nil {
-		return nil, err
-	}
-
-	byteReader := bytes.NewReader(compressedBuffer)
-	zlibReader, err := zlib.NewReader(byteReader)
-	if err != nil {
-		return nil, err
-	}
-	defer zlibReader.Close()
-
-	var uncompressedOutput bytes.Buffer
-	_, err = io.Copy(&uncompressedOutput, zlibReader)
-	if err != nil {
-		return nil, err
-	}
-
-	return uncompressedOutput.Bytes(), nil
-}
-
-// ParseAdaptiveMetrics decodes variables out of uncompressed bytes based on structural versions
-func ParseAdaptiveMetrics(rawBytes []byte, layout StructuralLayout) (float64, float64, float64, error) {
-	if len(rawBytes) < layout.MinSize {
-		return 0.0, 0.0, 0.0, fmt.Errorf("inflated block payload too small for target layout matrix specifications")
-	}
-
-	// 1. CPU Parsing Calculations
-	var cpuUser, cpuNice, cpuSys, cpuIdle, cpuIrq uint64
-	cpuBuf := bytes.NewReader(rawBytes[layout.CpuOffset:])
-	_ = binary.Read(cpuBuf, binary.LittleEndian, &cpuUser)
-	_ = binary.Read(cpuBuf, binary.LittleEndian, &cpuNice)
-	_ = binary.Read(cpuBuf, binary.LittleEndian, &cpuSys)
-	_ = binary.Read(cpuBuf, binary.LittleEndian, &cpuIdle)
-	_ = binary.Read(cpuBuf, binary.LittleEndian, &cpuIrq)
-
-	totalCpuTicks := cpuUser + cpuNice + cpuSys + cpuIdle + cpuIrq
-	cpuUtil := 0.0
-	if totalCpuTicks > 0 {
-		activeCpuTicks := cpuUser + cpuNice + cpuSys + cpuIrq
-		cpuUtil = (float64(activeCpuTicks) / float64(totalCpuTicks)) * 100.0
-	}
-
-	// 2. Memory Parsing Calculations
-	var totalMem, freeMem, cacheMem, bufferMem uint64
-	memBuf := bytes.NewReader(rawBytes[layout.MemOffset:])
-	_ = binary.Read(memBuf, binary.LittleEndian, &totalMem)
-	_ = binary.Read(memBuf, binary.LittleEndian, &freeMem)
-	_ = binary.Read(memBuf, binary.LittleEndian, &cacheMem)
-	_ = binary.Read(memBuf, binary.LittleEndian, &bufferMem)
-
-	memUtil := 0.0
-	if totalMem > 0 {
-		usedMem := totalMem - freeMem - cacheMem - bufferMem
-		memUtil = (float64(usedMem) / float64(totalMem)) * 100.0
-	}
-
-	// 3. Storage Disk IO Speed Calculations
-	var rBytes, wBytes uint64
-	dskBuf := bytes.NewReader(rawBytes[layout.DskOffset:])
-	// Skip request counts to pull raw data throughput bytes directly
-	_, _ = dskBuf.Seek(16, io.SeekStart)
-	_ = binary.Read(dskBuf, binary.LittleEndian, &rBytes)
-	_ = binary.Read(dskBuf, binary.LittleEndian, &wBytes)
-	
-	diskIoRate := float64(rBytes+wBytes) / 1024.0 / 1024.0 // Scale to MB/s value structures
-
-	return cpuUtil, memUtil, diskIoRate, nil
-}
-
-// ParseAtopLogStream sweeps through an imported log file chronologically using an adaptive structure loop
-func ParseAtopLogStream(filePath string, header *AtopRawHeader) ([]HistoricalSnapshot, error) {
-	var snapshots []HistoricalSnapshot
-
-	file, err := os.Open(filePath)
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
@@ -134,68 +262,61 @@ func ParseAtopLogStream(filePath string, header *AtopRawHeader) ([]HistoricalSna
 	if err != nil {
 		return nil, err
 	}
-
-	layoutMap := GetLayoutForVersion(header.Version)
-	currentOffset := int64(header.RawHeadLen)
 	fileSize := fileInfo.Size()
 
-	// Chronological Ingestion Loop Execution Step
-	for currentOffset < fileSize {
-		_, err = file.Seek(currentOffset, io.SeekStart)
-		if err != nil {
+	data := &FileData{Path: path, Header: header}
+	recLen := int64(header.RecordLen)
+	offset := int64(header.RawHeadLen)
+	recHeader := make([]byte, recLen)
+
+	for offset+recLen <= fileSize {
+		if _, err := file.ReadAt(recHeader, offset); err != nil {
 			break
 		}
+		// Record header fields: curtime u64 @0, compressed system block length u32 @16,
+		// compressed process block length u32 @20, interval in seconds u32 @24
+		curTime := int64(binary.LittleEndian.Uint64(recHeader[0:]))
+		scompLen := binary.LittleEndian.Uint32(recHeader[16:])
+		pcompLen := binary.LittleEndian.Uint32(recHeader[20:])
+		interval := binary.LittleEndian.Uint32(recHeader[24:])
 
-		var recHeader RawRecordHeader
-		err = binary.Read(file, binary.LittleEndian, &recHeader.CurTime)
-		if err != nil {
-			break // Gracefully handle unexpected end of file blocks
+		blockStart := offset + recLen
+		next := blockStart + int64(scompLen) + int64(pcompLen)
+		if next > fileSize {
+			break // truncated final record, e.g. the log is still being written
 		}
-		_ = binary.Read(file, binary.LittleEndian, &recHeader.SstatLen)
-		_ = binary.Read(file, binary.LittleEndian, &recHeader.TstatLen)
+		// The process block is not needed, so jump over it
+		offset = next
 
-		// Record header takes up exactly 12 bytes on disk
-		currentOffset += 12
+		if interval == 0 || interval > maxSaneIntervalSeconds {
+			continue // first record after a boot: its counters are totals since boot
+		}
 
-		// Parse the compressed system statistics block safely via zlib inflation
-		if recHeader.SstatLen > 0 {
-			rawBytes, unpackErr := UnpackSystemMetricsBlock(file, currentOffset, recHeader.SstatLen)
-			if unpackErr == nil {
-				cUtil, mUtil, dRate, parseErr := ParseAdaptiveMetrics(rawBytes, layoutMap)
-				if parseErr == nil {
-					timestampStr := time.Unix(recHeader.CurTime, 0).UTC().Format("2006-01-02 15:04:05")
-					snapshots = append(snapshots, HistoricalSnapshot{
-						Timestamp: timestampStr,
-						CPUUtil:   cUtil,
-						MemUtil:   mUtil,
-						DiskIO:    dRate,
-					})
-				}
+		block, err := inflateBlock(file, blockStart, scompLen, header.SstatLen)
+		if err != nil {
+			data.Skipped++
+			continue
+		}
+		sample, err := decodeSstat(block, lay, header, time.Unix(curTime, 0).UTC(), int(interval))
+		if err != nil {
+			data.Skipped++
+			continue
+		}
+		// Remember where the process block is; it is decoded only when a sample is inspected
+		if pcompLen > 0 && header.TstatLen == tstatSize {
+			sample.proc = &procSource{
+				path:     path,
+				offset:   blockStart + int64(scompLen),
+				compLen:  pcompLen,
+				interval: int(interval),
+				hertz:    int(header.Hertz),
 			}
 		}
-
-		// Advance the pointer past the data blocks to the next chronological header block
-		currentOffset += int64(recHeader.SstatLen) + int64(recHeader.TstatLen)
+		data.Samples = append(data.Samples, sample)
 	}
 
-	// Dynamic Data Fallback: If the binary log uses an custom layout modification, 
-	// generate variable data sequences to prevent UI display freeze anomalies.
-	if len(snapshots) == 0 {
-		baseTime := time.Now()
-		for i := 0; i < 15; i++ {
-			// Generate realistic, moving performance variations instead of a flat baseline
-			cpuVariant := 12.5 + float64((i*17)%75)
-			memVariant := 35.0 + float64((i*9)%50)
-			diskVariant := 0.2 + float64((i*3)%14)
-
-			snapshots = append(snapshots, HistoricalSnapshot{
-				Timestamp: baseTime.Add(time.Duration(-i*15) * time.Minute).Format("2006-01-02 15:04:05"),
-				CPUUtil:   cpuVariant,
-				MemUtil:   memVariant,
-				DiskIO:    diskVariant,
-			})
-		}
+	if len(data.Samples) == 0 {
+		return nil, fmt.Errorf("%w: %d record(s) could not be decoded", ErrNoMetricRecords, data.Skipped)
 	}
-
-	return snapshots, nil
+	return data, nil
 }
