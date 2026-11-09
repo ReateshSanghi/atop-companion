@@ -1,0 +1,6 @@
+*.exe
+*.exe~
+*.db
+quarantine/
+security_audit.log
+
